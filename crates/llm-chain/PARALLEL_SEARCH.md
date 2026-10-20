@@ -33,6 +33,9 @@ No LLM or search credentials are needed for this standalone command. The client
 connects to `https://search.parallel.ai/mcp` using HTTP MCP. It does not read API
 keys from environment variables. Anonymous access has service rate limits; quota,
 HTTP, protocol and tool errors are returned to the caller without automatic retries.
+If a transport session expires (HTTP 404), the error is returned and the cached
+connection is cleared. A subsequent invocation reconnects; retain the same
+`ToolContext` when explicitly retrying that research task.
 
 For related direct searches and page extraction, retain one `ToolContext`:
 
@@ -53,7 +56,7 @@ fresh context. Page fetching is available through `fetch`; the self-ask agent
 itself invokes only search.
 
 Each MCP request has a 30-second timeout, configurable with
-`ParallelSearch::new()?.with_timeout(Duration::from_secs(10))`. To use a custom
+`ParallelSearch::new()?.with_timeout(std::time::Duration::from_secs(10))`. To use a custom
 timeout in self-ask, pass that tool to `Agent::new`. Dropping the invocation or
 agent-run future cancels its pending request. The existing agent elapsed-time
 limit is checked between iterations, so it is not a hard deadline for a running

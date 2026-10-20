@@ -5,9 +5,16 @@ use crate::{
     output::Output,
     prompt::Prompt,
     tokens::{TokenCollection, Tokenizer, TokenizerError},
-    tools::{tools::ParallelSearchError, ToolContext},
+    tools::{
+        tools::{
+            GoogleSerper, GoogleSerperError, GoogleSerperInput, GoogleSerperOutput,
+            ParallelSearchError, ParallelSearchInput, ParallelSearchOutput,
+        },
+        ToolContext, ToolDescription, ToolError,
+    },
 };
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -19,6 +26,7 @@ use std::{
     },
     thread,
 };
+use thiserror::Error;
 
 #[derive(Clone, Debug)]
 struct Request {
@@ -103,7 +111,7 @@ impl Server {
             );
             assert!(!request.headers.contains_key("authorization"));
             if request.body["method"] != "initialize" {
-                assert_eq!(request.headers["mcp-session-id"], "transport-session");
+                assert!(request.headers["mcp-session-id"].starts_with("transport-session-"));
                 assert_eq!(request.headers["mcp-protocol-version"], "2025-03-26");
             }
         }
@@ -161,6 +169,7 @@ fn serve(mut stream: TcpStream, requests: Arc<Mutex<Vec<Request>>>) {
         bytes.extend_from_slice(&chunk[..n]);
     }
     let body: Value = serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+    let transport_session = headers.get("mcp-session-id").cloned();
     requests.lock().unwrap().push(Request {
         path,
         headers,
@@ -172,6 +181,9 @@ fn serve(mut stream: TcpStream, requests: Arc<Mutex<Vec<Request>>>) {
         .unwrap_or("");
     if query == "timeout" || query == "cancel" {
         thread::sleep(Duration::from_millis(250));
+    }
+    if query == "expired-delayed" {
+        thread::sleep(Duration::from_millis(180));
     }
     let result = match method {
         "initialize" => {
@@ -196,6 +208,14 @@ fn serve(mut stream: TcpStream, requests: Arc<Mutex<Vec<Request>>>) {
     };
     let (status, content_type, text) = if method == "notifications/initialized" {
         ("202 Accepted", "application/json", String::new())
+    } else if query.starts_with("expired")
+        && transport_session.as_deref() == Some("transport-session-1")
+    {
+        (
+            "404 Not Found",
+            "application/json",
+            "expired MCP session".into(),
+        )
     } else if query == "http-error" {
         (
             "503 Service Unavailable",
@@ -214,15 +234,36 @@ fn serve(mut stream: TcpStream, requests: Arc<Mutex<Vec<Request>>>) {
         ("200 OK", "application/json", response.to_string())
     };
     let session = if method == "initialize" {
-        "Mcp-Session-Id: transport-session\r\n"
+        let generation = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.body["method"] == "initialize")
+            .count();
+        format!("Mcp-Session-Id: transport-session-{generation}\r\n")
     } else {
-        ""
+        String::new()
     };
     let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{session}Content-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len());
 }
 
 struct ScriptedModel;
 struct UnusedTokenizer;
+
+crate::multitool!(
+    ContextTools,
+    ContextInput,
+    ContextOutput,
+    ContextError,
+    ParallelSearch,
+    ParallelSearchInput,
+    ParallelSearchOutput,
+    ParallelSearchError,
+    GoogleSerper,
+    GoogleSerperInput,
+    GoogleSerperOutput,
+    GoogleSerperError
+);
 
 impl Tokenizer for UnusedTokenizer {
     fn tokenize_str(&self, _: &str) -> Result<TokenCollection, TokenizerError> {
@@ -279,6 +320,31 @@ impl Executor for ScriptedModel {
     fn answer_prefix(&self, _: &Prompt) -> Option<String> {
         None
     }
+}
+
+#[tokio::test]
+async fn multitool_dispatch_preserves_the_supplied_context() {
+    let server = Server::new();
+    let tools: ContextTools = ParallelSearch::new()
+        .unwrap()
+        .with_test_endpoint(&server.url)
+        .into();
+    let context = ToolContext::default();
+    for query in ["wrapped-first", "wrapped-followup"] {
+        let input: ContextInput = ParallelSearchInput::from(query).into();
+        tools
+            .invoke_typed_with_context(&input, &context)
+            .await
+            .unwrap();
+    }
+    assert_eq!(server.calls().len(), 2);
+    for call in server.calls() {
+        assert_eq!(
+            call.body["params"]["arguments"]["session_id"],
+            context.session_id().to_string()
+        );
+    }
+    server.assert_transport();
 }
 
 #[tokio::test]
@@ -397,6 +463,63 @@ async fn search_fetch_followup_and_quota_retry_keep_context() {
         server.calls().last().unwrap().body["params"]["arguments"]["session_id"],
         context.session_id().to_string()
     );
+    server.assert_transport();
+}
+
+#[tokio::test]
+async fn expired_sessions_recover_on_explicit_retry_without_losing_context() {
+    let server = Server::new();
+    let tool = ParallelSearch::new()
+        .unwrap()
+        .with_test_endpoint(&server.url);
+    let context = ToolContext::default();
+    tool.invoke_typed_with_context(&"first".into(), &context)
+        .await
+        .unwrap();
+    let delayed_input = "expired-delayed".into();
+    let old_request = tool.invoke_typed_with_context(&delayed_input, &context);
+    let recover = async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.calls().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(tool.invoke_typed_with_context(&"expired".into(), &context).await,
+            Err(ParallelSearchError::Request(error)) if error.status() == Some(reqwest::StatusCode::NOT_FOUND))
+        );
+        // The explicit retry, using the same context, initializes a new transport.
+        tool.invoke_typed_with_context(&"expired".into(), &context)
+            .await
+            .unwrap();
+    };
+    let (old, ()) = futures::join!(old_request, recover);
+    assert!(
+        matches!(old, Err(ParallelSearchError::Request(error)) if error.status() == Some(reqwest::StatusCode::NOT_FOUND))
+    );
+    // The late 404 for the first transport must not invalidate the new one.
+    tool.invoke_typed_with_context(&"after-recovery".into(), &context)
+        .await
+        .unwrap();
+    assert_eq!(server.calls().len(), 5);
+    assert_eq!(
+        server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.body["method"] == "initialize")
+            .count(),
+        2
+    );
+    for call in server.calls() {
+        assert_eq!(
+            call.body["params"]["arguments"]["session_id"],
+            context.session_id().to_string()
+        );
+    }
     server.assert_transport();
 }
 

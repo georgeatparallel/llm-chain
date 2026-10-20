@@ -31,6 +31,7 @@ pub struct ParallelSearch {
 #[derive(Clone)]
 struct Connection {
     session: Option<HeaderValue>,
+    generation: u64,
 }
 
 impl ParallelSearch {
@@ -138,6 +139,7 @@ impl ParallelSearch {
             .await?;
         let connection = Connection {
             session: response.headers().get("Mcp-Session-Id").cloned(),
+            generation: id,
         };
         let initialized = Self::response(response, id).await?;
         if initialized["protocolVersion"] != PROTOCOL {
@@ -188,7 +190,22 @@ impl ParallelSearch {
             "params": {"name": name, "arguments": arguments}}),
                 Some(&connection),
             )
-            .await?;
+            .await;
+        let response = match response {
+            Err(ParallelSearchError::Request(error))
+                if error.status() == Some(reqwest::StatusCode::NOT_FOUND) =>
+            {
+                // MCP sessions can expire. Return the error without replaying;
+                // the caller can retry with its existing conversation context.
+                // An old concurrent response must not discard a newer session.
+                let mut cached = self.connection.lock().await;
+                if cached.as_ref().map(|c| c.generation) == Some(connection.generation) {
+                    *cached = None;
+                }
+                return Err(ParallelSearchError::Request(error));
+            }
+            result => result?,
+        };
         let result = Self::response(response, id).await?;
         let text = result["content"]
             .as_array()
